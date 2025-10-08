@@ -5,7 +5,7 @@ from pathlib import Path
 from .default_config import DEFAULT_CONFIG, MODERN_YT_DLP_OPTS
 
 class ConfigManager:
-    """Enterprise-grade configuration manager with validation and environment support"""
+    """The ACJ's Enterprise-grade configuration manager with validation and environment support"""
 
     def __init__(self, config_file: Optional[str] = None) -> None:
         self.config: Dict[str, Any] = DEFAULT_CONFIG.copy()

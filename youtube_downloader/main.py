@@ -28,7 +28,8 @@ def signal_handler(signum, frame):
 
     if shutdown_in_progress:
         print("\n⚠️  Force shutdown requested. Exiting immediately...")
-        sys.exit(1)
+        # Force exit without cleanup
+        os._exit(1)
 
     shutdown_in_progress = True
     print("\n🛑 Received shutdown signal. Initiating graceful shutdown...")
@@ -44,12 +45,8 @@ def signal_handler(signum, frame):
         except Exception as e:
             logger.error(f"Error stopping downloader: {e}")
 
-    # Give some time for cleanup
-    print("🧹 Cleaning up resources...")
-    time.sleep(1)
-
-    print("✅ Graceful shutdown completed.")
-    sys.exit(0)
+    # Note: We don't exit here anymore - let the main thread handle cleanup
+    # The main thread will detect the shutdown_event and exit gracefully
 
 def setup_signal_handlers():
     """Setup signal handlers for graceful shutdown"""
@@ -62,6 +59,11 @@ def main():
 
     # Setup signal handlers for graceful shutdown
     setup_signal_handlers()
+
+    # Check if shutdown was already requested (e.g., from previous signal)
+    if shutdown_event.is_set():
+        print("🛑 Shutdown already in progress. Exiting...")
+        return
 
     config = ConfigManager()
 
@@ -123,19 +125,59 @@ def main():
     print(f"\n🚀 Starting download of {len(valid_urls)} URL(s)...")
     print("💡 Press Ctrl+C to stop gracefully at any time")
 
+    # Start download in a separate thread to keep main thread responsive
+    from concurrent.futures import ThreadPoolExecutor, Future
+    import time
+
+    download_future: Optional[Future] = None
+
+    def run_download():
+        """Run download in separate thread"""
+        try:
+            return downloader.download_multiple_urls(valid_urls, audio_only)
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            raise
+
     try:
-        results = downloader.download_multiple_urls(valid_urls, audio_only)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            download_future = executor.submit(run_download)
 
-        # Clear active downloader reference
-        active_downloader = None
+            # Monitor the download while keeping main thread responsive
+            while not download_future.done():
+                if shutdown_event.is_set():
+                    print("\n🛑 Shutdown requested. Cancelling download...")
+                    download_future.cancel()
+                    try:
+                        # Wait a bit for cancellation
+                        download_future.result(timeout=2.0)
+                    except:
+                        pass
+                    break
 
-        # Print summary
-        print_download_summary(results, config.get('output_path'))
+                # Small sleep to prevent busy waiting
+                time.sleep(0.1)
+
+            # Get results if download completed
+            if not download_future.cancelled():
+                results = download_future.result()
+                # Clear active downloader reference
+                active_downloader = None
+                # Print summary
+                print_download_summary(results, config.get('output_path'))
+            else:
+                print("\n❌ Download was cancelled")
+                active_downloader = None
 
     except Exception as e:
         # Clear active downloader reference on error
         active_downloader = None
         raise  # Re-raise to be handled by outer exception handler
+
+    # Final check for shutdown signal
+    if shutdown_event.is_set():
+        print("\n🛑 Shutdown completed gracefully.")
+        return
 
 if __name__ == "__main__":
     try:

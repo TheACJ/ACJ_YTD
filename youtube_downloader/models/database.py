@@ -85,6 +85,14 @@ class DatabaseManager:
     def save_download_job(self, job: DownloadJob) -> None:
         """Save a download job to database"""
         with self._get_connection() as conn:
+            # Convert config to dict and handle Path objects
+            config_dict = job.config.__dict__ if hasattr(job.config, '__dict__') else job.config
+            if hasattr(config_dict, 'get') and 'output_path' in config_dict:
+                # Convert Path objects to strings
+                config_dict = dict(config_dict)
+                if hasattr(config_dict['output_path'], '__str__'):
+                    config_dict['output_path'] = str(config_dict['output_path'])
+
             conn.execute('''
                 INSERT OR REPLACE INTO download_jobs
                 (id, urls, config, status, created_at, started_at, completed_at, error)
@@ -92,7 +100,7 @@ class DatabaseManager:
             ''', (
                 job.id,
                 json.dumps(job.urls),
-                json.dumps(job.config.__dict__ if hasattr(job.config, '__dict__') else job.config),
+                json.dumps(config_dict),
                 job.status,
                 job.created_at,
                 job.started_at,
@@ -137,6 +145,11 @@ class DatabaseManager:
                 from .data_models import DownloadConfig
                 urls = json.loads(row['urls'])
                 config_dict = json.loads(row['config'])
+
+                # Convert string path back to Path object
+                if 'output_path' in config_dict:
+                    config_dict['output_path'] = Path(config_dict['output_path'])
+
                 config = DownloadConfig(**config_dict)
 
                 return DownloadJob(

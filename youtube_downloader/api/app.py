@@ -8,16 +8,30 @@ import uuid
 from datetime import datetime
 import asyncio
 from pathlib import Path
+import sys
+import os
 
-from models.data_models import (
+# Added project root to path for proper imports
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+from youtube_downloader.models.data_models import (
     DownloadJob, DownloadResult, DownloadConfig, DownloadMetrics,
     SystemHealth, VideoInfo, PlaylistInfo
 )
-from models.database import DatabaseManager
-from config.config_manager import ConfigManager
-from core.downloader import YouTubeDownloader
-from core.url_handler import validate_youtube_url, get_content_type
-from utils.logger import setup_logger
+from pydantic import BaseModel
+
+class DownloadRequest(BaseModel):
+    """Request model for download jobs"""
+    urls: List[str]
+    audio_only: bool = False
+    output_path: Optional[str] = None
+    max_workers: Optional[int] = None
+from youtube_downloader.models.database import DatabaseManager
+from youtube_downloader.config.config_manager import ConfigManager
+from youtube_downloader.core.downloader import YouTubeDownloader
+from youtube_downloader.core.url_handler import validate_youtube_url, get_content_type
+from youtube_downloader.utils.logger import setup_logger
 
 # Initialize components
 logger = setup_logger(__name__)
@@ -28,7 +42,7 @@ config = ConfigManager()
 active_jobs: Dict[str, DownloadJob] = {}
 
 app = FastAPI(
-    title="YouTube Downloader API",
+    title=" The ACJ's sYouTube Downloader API",
     description="Enterprise-grade YouTube download service with REST API",
     version="4.0.0",
     docs_url="/docs",
@@ -96,18 +110,15 @@ async def get_metrics(db: DatabaseManager = Depends(get_db)):
 
 @app.post("/downloads", response_model=Dict[str, str])
 async def create_download_job(
-    urls: List[str],
+    request: DownloadRequest,
     background_tasks: BackgroundTasks,
-    audio_only: bool = False,
-    output_path: Optional[str] = None,
-    max_workers: Optional[int] = None,
     db: DatabaseManager = Depends(get_db),
     config: ConfigManager = Depends(get_config)
 ):
     """Create a new download job"""
     # Validate URLs
     valid_urls = []
-    for url in urls:
+    for url in request.urls:
         if validate_youtube_url(url):
             valid_urls.append(url)
         else:
@@ -118,9 +129,9 @@ async def create_download_job(
 
     # Create job configuration
     job_config = DownloadConfig(
-        output_path=Path(output_path or config.get('output_path')),
-        audio_only=audio_only,
-        max_workers=max_workers or config.get('max_workers', 3)
+        output_path=Path(request.output_path or config.get('output_path')),
+        audio_only=request.audio_only,
+        max_workers=request.max_workers or config.get('max_workers', 3)
     )
 
     # Create job
@@ -154,8 +165,18 @@ async def process_download_job(job_id: str):
         job.started_at = datetime.now()
         db.save_download_job(job)
 
+        # Create a temporary config manager from job config
+        temp_config = ConfigManager()
+        temp_config.config.update({
+            'output_path': str(job.config.output_path),
+            'audio_only': job.config.audio_only,
+            'max_workers': job.config.max_workers,
+            'format_preference': job.config.format_preference,
+            'enable_sponsorblock': getattr(job.config, 'enable_sponsorblock', False),
+        })
+
         # Initialize downloader
-        downloader = YouTubeDownloader(job.config)
+        downloader = YouTubeDownloader(temp_config)
 
         # Process downloads
         results = await asyncio.get_event_loop().run_in_executor(
