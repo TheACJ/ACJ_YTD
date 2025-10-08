@@ -1,0 +1,14 @@
+*env
+*__pycache__/*
+*downloads/*
+*.mp4
+*.mkv
+*.webm
+*.part
+*.log
+*.sqlite3
+htmlcov/
+.vscode/
+.DS_Store
+.idea/
+*.pyc

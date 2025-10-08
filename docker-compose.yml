@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # Redis for message queuing and caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # API Gateway - Main entry point
+  api-gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - JOB_MANAGER_URL=http://job-manager:8001
+      - DOWNLOAD_WORKER_URL=http://download-worker:8002
+      - STORAGE_SERVICE_URL=http://storage-service:8003
+      - ANALYTICS_SERVICE_URL=http://analytics-service:8004
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - job-manager
+      - download-worker
+      - storage-service
+      - analytics-service
+      - redis
+    restart: unless-stopped
+    command: python services/api-gateway/app.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Job Management Service - Queue and job lifecycle
+  job-manager:
+    build: .
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PORT=8001
+    depends_on:
+      - redis
+    restart: unless-stopped
+    command: python services/job-manager/app.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Download Worker Service - Actual downloading with resume
+  download-worker:
+    build: .
+    volumes:
+      - ./downloads:/app/downloads
+      - ./resume_data:/app/resume_data
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PORT=8002
+      - DOWNLOAD_DIR=/app/downloads
+    depends_on:
+      - redis
+      - storage-service
+    restart: unless-stopped
+    command: python services/download-worker/app.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Storage Service - File management
+  storage-service:
+    build: .
+    volumes:
+      - ./storage:/app/storage
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PORT=8003
+      - STORAGE_PATH=/app/storage
+    depends_on:
+      - redis
+    restart: unless-stopped
+    command: python services/storage-service/app.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Analytics Service - Metrics and reporting
+  analytics-service:
+    build: .
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PORT=8004
+    depends_on:
+      - redis
+    restart: unless-stopped
+    command: python services/analytics-service/app.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Add a reverse proxy for production
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api-gateway
+    restart: unless-stopped
+    profiles:
+      - proxy
+
+volumes:
+  redis_data:
