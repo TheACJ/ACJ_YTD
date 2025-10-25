@@ -117,6 +117,27 @@ def main():
     if audio_only:
         config.set('audio_only', True)
 
+    # Live stream specific options
+    has_live_streams = any(get_content_type(url) == 'live' for url in urls)
+    if has_live_streams:
+        print("\n📺 Live stream(s) detected!")
+        use_cookies = input("Use browser cookies for authentication? (Y/n): ").strip().lower()
+        if use_cookies != 'n':
+            browser = input("Browser for cookies (chrome/firefox/edge) [chrome]: ").strip().lower()
+            if browser in ['chrome', 'firefox', 'edge']:
+                config.set('browser_cookies', browser)
+            else:
+                config.set('browser_cookies', 'chrome')
+            print(f"💡 Make sure {browser} is logged into YouTube for better access")
+            print("💡 If automatic cookie extraction fails, you can manually export cookies")
+            print("💡 Save them as 'cookies.txt' in the project root directory")
+
+        proxy = input("Use proxy for geo-restricted content? (y/N): ").strip().lower()
+        if proxy == 'y':
+            proxy_url = input("Proxy URL (http://host:port): ").strip()
+            if proxy_url:
+                config.set('proxy_url', proxy_url)
+
     # Initialize downloader and track it globally for shutdown
     downloader = YouTubeDownloader(config)
     active_downloader = downloader
