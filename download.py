@@ -91,7 +91,7 @@ DEFAULT_CONFIG = {
     'geo_bypass': True,
     'age_limit': None,
     'archive_file': '.youtube_archive.txt',
-    'use_archive': True,
+    'use_archive': False,
     'prefer_free_formats': False,
     'extract_flat': False,
     'ignore_errors': True,
@@ -321,12 +321,22 @@ class NetworkManager:
 
 class SmartDownloader:
     """Enhanced downloader with intelligent features"""
-    
+
     def __init__(self, config_manager: 'EnhancedConfigManager', db_manager: DatabaseManager):
         self.config = config_manager
         self.db = db_manager
         self.network = NetworkManager(config_manager.config)
         self.cookie_manager = None
+
+    def is_live_stream(self, url: str) -> bool:
+        """Check if the URL is for a live stream"""
+        try:
+            with YoutubeDL({'quiet': True, 'no_warnings': True, 'extract_flat': False}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return info.get('is_live', False)
+        except Exception as e:
+            logger.warning(f"Could not check if live for {url}: {e}")
+            return False
         
     def get_optimized_format(self, info_dict: Dict, quality_preference: str = None) -> str:
         """Get optimized format based on available formats and network conditions"""
@@ -375,7 +385,7 @@ class SmartDownloader:
         # Complete format string
         return f"{base_format}+bestaudio/best"
     
-    def create_ydl_opts(self, output_path: str, process_id: int = 0, 
+    def create_ydl_opts(self, url: str, output_path: str, process_id: int = 0,
                         progress_queue: Queue = None) -> Dict:
         """Create optimized yt-dlp options"""
         
@@ -404,9 +414,9 @@ class SmartDownloader:
             # Subtitle options
             'writesubtitles': self.config.get('download_subtitles', True),
             'writeautomaticsub': self.config.get('download_subtitles', True),
-            'allsubtitles': True,
+            'allsubtitles': False,
             'subtitlesformat': 'best',
-            'subtitleslangs': ['en', 'en-US'],
+            'subtitleslangs': ['en'],
             'embedsubtitles': self.config.get('embed_subtitles', True),
             
             # Thumbnail options
@@ -452,7 +462,10 @@ class SmartDownloader:
             # External downloader
             'external_downloader': self._get_external_downloader(),
             'external_downloader_args': self._get_external_downloader_args(),
-            
+
+            # FFmpeg location
+            'ffmpeg_location': 'C:\\Users\\TheACJ\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1-full_build-shared\\bin\\ffmpeg.exe',
+
             # Progress hooks
             'progress_hooks': [],
             
@@ -466,8 +479,8 @@ class SmartDownloader:
                 self._create_progress_hook(process_id, progress_queue)
             )
         
-        # Add cookies if configured
-        if self.config.get('use_cookies'):
+        # Add cookies only for live streams
+        if self.is_live_stream(url):
             if self.config.get('cookies_file'):
                 ydl_opts['cookiefile'] = self.config.get('cookies_file')
             else:
@@ -802,7 +815,7 @@ def enhanced_download_worker(process_id: int, url: str, output_path: str,
     
     try:
         # Create optimized yt-dlp options
-        ydl_opts = smart_downloader.create_ydl_opts(output_path, process_id, progress_queue)
+        ydl_opts = smart_downloader.create_ydl_opts(url, output_path, process_id, progress_queue)
         
         # Perform download with retry
         success, result = smart_downloader.download_with_retry(url, ydl_opts, config.get('max_retries', 3))
@@ -812,7 +825,7 @@ def enhanced_download_worker(process_id: int, url: str, output_path: str,
                 'url': url,
                 'process_id': process_id,
                 'success': True,
-                'message': f"✅ [Process {process_id}] Download completed successfully!",
+                'message': f"[Process {process_id}] Download completed successfully!",
                 'info': result
             })
         else:
@@ -820,7 +833,7 @@ def enhanced_download_worker(process_id: int, url: str, output_path: str,
                 'url': url,
                 'process_id': process_id,
                 'success': False,
-                'message': f"❌ [Process {process_id}] Download failed: {result}"
+                'message': f"[Process {process_id}] Download failed: {result}"
             })
     
     except Exception as e:
@@ -829,7 +842,7 @@ def enhanced_download_worker(process_id: int, url: str, output_path: str,
             'url': url,
             'process_id': process_id,
             'success': False,
-            'message': f"❌ [Process {process_id}] Error: {str(e)}"
+                'message': f"[Process {process_id}] Error: {str(e)}"
         })
     
     finally:
@@ -869,15 +882,15 @@ def download_youtube_enhanced(urls: List[str], config: EnhancedConfigManager = N
     result_queue = Queue()
     
     # Initialize progress manager
-    from .enhanced_components import EnhancedProgressManager
+    from enhanced_components import EnhancedProgressManager
     progress_manager = EnhancedProgressManager(max_workers)
     progress_manager.start_monitoring()
     
-    print(f"\n🚀 Enhanced YouTube Downloader v4.0")
-    print(f"📁 Output: {output_path}")
-    print(f"⚡ Workers: {max_workers}")
-    print(f"🎯 Quality: {config.get('format_preference')}")
-    print(f"📊 URLs to process: {len(urls)}")
+    print(f"\nEnhanced YouTube Downloader v4.0")
+    print(f"Output: {output_path}")
+    print(f"Workers: {max_workers}")
+    print(f"Quality: {config.get('format_preference')}")
+    print(f"URLs to process: {len(urls)}")
     
     # Show enabled features
     features = []
@@ -897,7 +910,7 @@ def download_youtube_enhanced(urls: List[str], config: EnhancedConfigManager = N
         features.append("Aria2c")
     
     if features:
-        print(f"✨ Features: {', '.join(features)}")
+        print(f"Features: {', '.join(features)}")
     
     print("-" * 60)
     
@@ -951,7 +964,7 @@ def download_youtube_enhanced(urls: List[str], config: EnhancedConfigManager = N
                 continue
     
     except KeyboardInterrupt:
-        print("\n🛑 Download interrupted by user")
+        print("\nDownload interrupted by user")
         for process in processes:
             if process.is_alive():
                 process.terminate()
@@ -970,24 +983,24 @@ def download_youtube_enhanced(urls: List[str], config: EnhancedConfigManager = N
     
     # Print summary
     print("\n" + "=" * 60)
-    print("📊 DOWNLOAD SUMMARY")
+    print("DOWNLOAD SUMMARY")
     print("=" * 60)
     
     successful = [r for r in results if r['success']]
     failed = [r for r in results if not r['success']]
     
-    print(f"✅ Successful: {len(successful)}")
-    print(f"❌ Failed: {len(failed)}")
-    
+    print(f"Successful: {len(successful)}")
+    print(f"Failed: {len(failed)}")
+
     if failed:
-        print("\n❌ Failed URLs:")
+        print("\nFailed URLs:")
         for result in failed:
             print(f"   • {result['url']}")
             print(f"     {result['message']}")
     
     # Show retry options for failed downloads
     if failed:
-        print("\n💡 To retry failed downloads, run with --retry-failed flag")
+        print("\nTo retry failed downloads, run with --retry-failed flag")
     
     # Show archive information
     if config.get('use_archive'):
@@ -995,7 +1008,7 @@ def download_youtube_enhanced(urls: List[str], config: EnhancedConfigManager = N
         if os.path.exists(archive_file):
             with open(archive_file, 'r') as f:
                 archived_count = len(f.readlines())
-            print(f"\n📚 Archive: {archived_count} videos tracked")
+            print(f"\nArchive: {archived_count} videos tracked")
 
 if __name__ == "__main__":
     # Parse command line arguments

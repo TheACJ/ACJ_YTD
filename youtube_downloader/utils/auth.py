@@ -105,8 +105,24 @@ class YouTubeAuthenticator:
                 logger.error(f"JSON cookie file not found: {json_file}")
                 return None
 
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            # Try different encodings for cookie files
+            encodings = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'latin-1']
+            data = None
+            for encoding in encodings:
+                try:
+                    with open(json_path, 'r', encoding=encoding) as f:
+                        content = f.read()
+                        # Remove BOM if present
+                        if content.startswith('\ufeff'):
+                            content = content[1:]
+                        data = json.loads(content)
+                    break
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+
+            if data is None:
+                logger.error(f"Failed to decode JSON file with any supported encoding")
+                return None
 
             cookies = data.get('cookies', [])
             if not cookies:
@@ -258,13 +274,19 @@ def setup_youtube_auth(config) -> Optional[str]:
 
         # Check for JSON cookie export and convert it
         project_root = Path(__file__).parent.parent
-        json_cookie_file = project_root / 'www.youtube.com.json'
-        if json_cookie_file.exists():
-            logger.info("Found Chrome JSON cookie export, converting to Netscape format...")
-            netscape_file = auth.convert_json_cookies_to_netscape(str(json_cookie_file))
-            if netscape_file and auth.validate_cookies(netscape_file):
-                logger.info("Successfully converted and validated JSON cookies")
-                return netscape_file
+        json_cookie_files = [
+            project_root / 'www.youtube.com.json',
+            project_root / 'cookies.json',
+            project_root / 'youtube_cookies.json'
+        ]
+
+        for json_file in json_cookie_files:
+            if json_file.exists():
+                logger.info(f"Found Chrome JSON cookie export: {json_file.name}, converting to Netscape format...")
+                netscape_file = auth.convert_json_cookies_to_netscape(str(json_file))
+                if netscape_file and auth.validate_cookies(netscape_file):
+                    logger.info("Successfully converted and validated JSON cookies")
+                    return netscape_file
 
         # Check for cookies.txt in project root
         fallback_cookie_file = project_root / 'cookies.txt'

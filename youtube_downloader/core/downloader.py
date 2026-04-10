@@ -1,14 +1,18 @@
+"""
+ACJ YouTube Downloader — core downloader
+Supports: restricted videos, age-gated, geo-blocked, live streams
+"""
 from yt_dlp import YoutubeDL
 import os
 import time
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
+from typing import Dict, List, Optional, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from config.config_manager import ConfigManager
-from config.default_config import LIVE_STREAM_OPTS, COOKIE_OPTS
+from config.default_config import LIVE_STREAM_OPTS
 from core.url_handler import get_content_type, validate_youtube_url
 from core.file_manager import FileManager
 from utils.logger import setup_logger
@@ -16,21 +20,30 @@ from utils.auth import setup_youtube_auth
 
 logger = setup_logger(__name__)
 
+
 class YouTubeDownloader:
     def __init__(self, config: ConfigManager):
         self.config = config
         self.file_manager = FileManager(config)
         self._stop_event = threading.Event()
+        # Injected by main.py: (url: str) -> yt-dlp progress hook callable
+        self._progress_hook_factory: Optional[Callable] = None
 
-    def get_modern_ydl_opts(self, audio_only: bool = False, is_live: bool = False) -> Dict:
-        """Get modern yt-dlp options with current YouTube workarounds """
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # yt-dlp options builder
+    # ─────────────────────────────────────────────────────────────────────────
+    def get_modern_ydl_opts(
+        self,
+        audio_only: bool = False,
+        is_live: bool = False,
+        url: str = "",
+        skip_cookies: bool = False,
+    ) -> Dict:
         base_opts = self.config.get_modern_ydl_opts().copy()
+        base_opts['outtmpl'] = self.file_manager.get_output_template(audio_only)
 
-        # Set output template
-        output_template = self.file_manager.get_output_template(audio_only)
-        base_opts['outtmpl'] = output_template
-
-        # Audio configuration
+        # ── Format ────────────────────────────────────────────────────────────
         if audio_only:
             base_opts.update({
                 'format': 'bestaudio/best',
@@ -43,284 +56,305 @@ class YouTubeDownloader:
                 'embedthumbnail': True,
             })
         else:
-            # Video configuration
             base_opts['format'] = self.config.get('format_preference')
             base_opts['merge_output_format'] = 'mp4'
 
-        # Live stream configuration with enhanced options
+        # ── Live stream ───────────────────────────────────────────────────────
         if is_live:
             live_opts = LIVE_STREAM_OPTS.copy()
-            # Customize wait times based on config
             live_opts['wait_for_video'] = (
                 self.config.get('live_stream_wait', 30),
-                self.config.get('live_stream_max_wait', 120)
+                self.config.get('live_stream_max_wait', 120),
             )
             base_opts.update(live_opts)
 
-        # Cookie-based authentication for restricted content
-        if self.config.get('use_cookies', True):
-            try:
-                cookie_file = setup_youtube_auth(self.config)
-                if cookie_file:
-                    base_opts['cookiefile'] = cookie_file
-                    logger.info("YouTube authentication enabled with browser cookies")
-                else:
-                    logger.warning("Cookie authentication setup failed - proceeding without cookies")
-            except Exception as e:
-                logger.warning(f"Failed to setup cookie authentication: {e}")
 
-        # Proxy support for geo-restricted content
+        # ── Restricted / age-gated bypass ─────────────────────────────────────
+        # player_client order: web → android → tv_embedded
+        # tv_embedded bypasses age gates without login
+        # android bypasses most bot-check 403s
+        base_opts['extractor_args'] = {
+            'youtube': {
+                'player_client': ['web', 'android', 'tv_embedded'],
+                'player_skip': [],
+            }
+        }
+        base_opts['geo_bypass'] = self.config.get('bypass_geo_restriction', True)
+
+        # ── Cookie authentication ─────────────────────────────────────────────
+        # skip_cookies=True is set on the fallback attempt when the browser
+        # DB is locked or unavailable, so yt-dlp still runs cookieless.
+        if not skip_cookies and self.config.get('use_cookies', True):
+            self._attach_cookies(base_opts)
+
+        # ── Proxy ─────────────────────────────────────────────────────────────
         proxy_url = self.config.get('proxy_url')
         if proxy_url:
             base_opts['proxy'] = proxy_url
-            logger.info(f"Using proxy: {proxy_url}")
 
-        # SponsorBlock integration
-        if self.config.get('enable_sponsorblock'):
-            base_opts['postprocessor_args'] = ['--sponsorblock-mark', 'all']
+        # ── Subtitles ─────────────────────────────────────────────────────────
+        base_opts.update({
+            'writesubtitles':   True,
+            'writeautomaticsub': True,
+            'subtitleslangs':   ['en'],
+            'subtitlesformat':  'best',
+            'embedsubtitles':   True,
+        })
+
+        # ── Archive ───────────────────────────────────────────────────────────
+        if self.config.get('use_archive'):
+            base_opts['download_archive'] = self.config.get('archive_file')
+
+        # ── Progress hook ─────────────────────────────────────────────────────
+        if self._progress_hook_factory and url:
+            base_opts['progress_hooks'] = [self._progress_hook_factory(url)]
 
         return base_opts
 
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cookie helpers
+    # ─────────────────────────────────────────────────────────────────────────
+    def _attach_cookies(self, opts: Dict) -> None:
+        """
+        Priority order:
+          1. Manual cookiefile (always works, browser can be open)
+          2. cookiesfrombrowser (browser must be closed on Windows)
+          3. setup_youtube_auth JSON→Netscape conversion
+        Each method is tried silently; failures are logged, not raised.
+        """
+        browser = self.config.get('browser_cookies', 'chrome')
+        manual_file = self.config.get('cookies_file')
+
+        # 1 ── Manual file takes priority (never locked, always portable)
+        if manual_file and Path(manual_file).exists():
+            opts['cookiefile'] = manual_file
+            logger.info(f"Cookie source: manual file → {manual_file}")
+            return
+
+        # 2 ── cookiesfrombrowser (yt-dlp native, handles DPAPI decryption)
+        if browser in ('chrome', 'firefox', 'edge', 'brave', 'opera', 'safari'):
+            opts['cookiesfrombrowser'] = (browser,)
+            logger.info(f"Cookie source: {browser} (cookiesfrombrowser)")
+            return
+
+        # 3 ── JSON → Netscape conversion via auth helper
+        try:
+            cookie_file = setup_youtube_auth(self.config)
+            if cookie_file:
+                opts['cookiefile'] = cookie_file
+                logger.info(f"Cookie source: setup_youtube_auth → {cookie_file}")
+        except Exception as e:
+            logger.warning(f"Cookie setup failed ({e}) — will proceed without cookies")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Single video download  (with cookie-locked fallback)
+    # ─────────────────────────────────────────────────────────────────────────
     def download_single_video(self, url: str, audio_only: Optional[bool] = None) -> Dict:
-        """Download a single video or live stream with enhanced error handling"""
         if audio_only is None:
             audio_only = self.config.get('audio_only', False)
 
-        # Check if shutdown was requested
         if self._stop_event.is_set():
-            return {
-                'success': False,
-                'url': url,
-                'error': 'Download cancelled by user'
-            }
+            return {'success': False, 'url': url, 'error': 'Cancelled'}
 
         content_type = get_content_type(url)
-        is_live = content_type == 'live'
+        is_live      = content_type == 'live'
+        max_retries  = self.config.get('max_retries', 10)
 
-        # Implement retry logic for live streams and 403 errors
-        max_retries = self.config.get('max_retries', 10)
-        retry_count = 0
+        # We run two passes:
+        #   pass 0 — with cookies (normal)
+        #   pass 1 — without cookies (fallback when browser DB is locked / unavailable)
+        # Each pass still gets max_retries for transient network errors.
+        for cookie_pass in range(2):
+            skip_cookies = (cookie_pass == 1)
+            if skip_cookies:
+                logger.warning("Cookie load failed — retrying WITHOUT cookies (tv_embedded client will handle age-gate)")
 
-        while retry_count <= max_retries:
-            try:
-                ydl_opts = self.get_modern_ydl_opts(audio_only, is_live)
-
-                # Add progress hooks
-                if hasattr(self, 'progress_hook'):
-                    ydl_opts['progress_hooks'] = [self.progress_hook]
-
-                logger.info(f"Downloading {content_type}: {url} (attempt {retry_count + 1}/{max_retries + 1})")
-
-                # Check for shutdown before starting download
+            for attempt in range(max_retries + 1):
                 if self._stop_event.is_set():
+                    return {'success': False, 'url': url, 'error': 'Cancelled'}
+
+                try:
+                    ydl_opts = self.get_modern_ydl_opts(audio_only, is_live, url, skip_cookies)
+                    logger.info(
+                        f"[pass {cookie_pass+1}/2 attempt {attempt+1}/{max_retries+1}] "
+                        f"{'(no cookies) ' if skip_cookies else ''}{url}"
+                    )
+
+                    with YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+
+                    if self._stop_event.is_set():
+                        return {'success': False, 'url': url, 'error': 'Interrupted'}
+
+                    if info is None:
+                        return {'success': False, 'url': url, 'error': 'No info extracted'}
+
                     return {
-                        'success': False,
-                        'url': url,
-                        'error': 'Download cancelled by user'
+                        'success':  True,
+                        'url':      url,
+                        'title':    info.get('title', 'Unknown'),
+                        'duration': info.get('duration', 0),
+                        'is_live':  is_live,
+                        'was_live': info.get('was_live', False),
                     }
+
+                except Exception as e:
+                    err = str(e)
+                    logger.warning(f"Pass {cookie_pass+1} attempt {attempt+1} failed: {err}")
+
+                    # Cookie errors → break inner loop, go to cookieless pass
+                    if self._is_cookie_error(err):
+                        logger.warning("Cookie error detected — switching to cookieless pass")
+                        break  # exits attempt loop, outer loop increments cookie_pass
+
+                    # Non-retryable → give up entirely
+                    if not self._is_retryable_error(err, is_live) or attempt >= max_retries:
+                        if cookie_pass == 0:
+                            break  # try cookieless pass before giving up
+                        return {'success': False, 'url': url, 'error': err}
+
+                    delay = self._retry_delay(attempt, is_live)
+                    logger.info(f"Retrying in {delay:.1f}s…")
+                    if self._stop_event.wait(timeout=delay):
+                        return {'success': False, 'url': url, 'error': 'Cancelled during retry'}
+
+        return {'success': False, 'url': url, 'error': 'All download passes failed'}
+
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Playlist / channel download
+    # ─────────────────────────────────────────────────────────────────────────
+    def download_playlist(self, url: str, audio_only: Optional[bool] = None) -> Dict:
+        if audio_only is None:
+            audio_only = self.config.get('audio_only', False)
+
+        if self._stop_event.is_set():
+            return {'success': False, 'url': url, 'error': 'Cancelled'}
+
+        for cookie_pass in range(2):
+            skip_cookies = (cookie_pass == 1)
+            try:
+                ydl_opts = self.get_modern_ydl_opts(audio_only, url=url, skip_cookies=skip_cookies)
+                ydl_opts['outtmpl'] = self.file_manager.get_playlist_output_template(audio_only)
+                logger.info(f"Downloading playlist {'(no cookies) ' if skip_cookies else ''}: {url}")
 
                 with YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
 
-                    # Check if shutdown was requested during download
-                    if self._stop_event.is_set():
-                        return {
-                            'success': False,
-                            'url': url,
-                            'error': 'Download interrupted by user'
-                        }
+                if self._stop_event.is_set():
+                    return {'success': False, 'url': url, 'error': 'Interrupted'}
 
-                    return {
-                        'success': True,
-                        'url': url,
-                        'title': info.get('title', 'Unknown'),
-                        'duration': info.get('duration', 0),
-                        'is_live': is_live,
-                        'was_live': info.get('was_live', False)
-                    }
+                entries = info.get('entries', []) if info else []
+                return {
+                    'success':            True,
+                    'url':                url,
+                    'type':               'playlist',
+                    'title':              info.get('title', 'Unknown') if info else 'Unknown',
+                    'entry_count':        len(entries),
+                    'downloaded_entries': sum(1 for e in entries if e and e.get('requested_downloads')),
+                }
 
             except Exception as e:
-                error_msg = str(e)
-                logger.warning(f"Download attempt {retry_count + 1} failed for {url}: {error_msg}")
+                err = str(e)
+                if self._is_cookie_error(err) and cookie_pass == 0:
+                    logger.warning(f"Cookie error on playlist — retrying without cookies: {err}")
+                    continue
+                logger.error(f"Playlist failed for {url}: {err}")
+                return {'success': False, 'url': url, 'error': err}
 
-                # Check if this is a retryable error
-                is_retryable = self._is_retryable_error(error_msg, is_live)
+        return {'success': False, 'url': url, 'error': 'Playlist download failed on all passes'}
 
-                if not is_retryable or retry_count >= max_retries:
-                    logger.error(f"Download failed permanently for {url}: {error_msg}")
-                    return {
-                        'success': False,
-                        'url': url,
-                        'error': error_msg
-                    }
+    # ─────────────────────────────────────────────────────────────────────────
+    # Dispatcher
+    # ─────────────────────────────────────────────────────────────────────────
+    def download_single_item(self, url: str, audio_only: bool) -> Dict:
+        content_type = get_content_type(url)
+        if content_type in ('playlist', 'channel'):
+            return self.download_playlist(url, audio_only)
+        return self.download_single_video(url, audio_only)
 
-                # Exponential backoff for retries
-                retry_delay = self._calculate_retry_delay(retry_count, is_live)
-                logger.info(f"Retrying in {retry_delay} seconds...")
-
-                if self._stop_event.wait(timeout=retry_delay):
-                    # Shutdown was requested during wait
-                    return {
-                        'success': False,
-                        'url': url,
-                        'error': 'Download cancelled by user'
-                    }
-
-                retry_count += 1
-
-        # Should not reach here, but just in case
-        return {
-            'success': False,
-            'url': url,
-            'error': f'Max retries ({max_retries}) exceeded'
-        }
-
-    def download_playlist(self, url: str, audio_only: Optional[bool] = None) -> Dict:
-        """Download playlist with batch support"""
-        if audio_only is None:
-            audio_only = self.config.get('audio_only', False)
-
-        # Check if shutdown was requested
-        if self._stop_event.is_set():
-            return {
-                'success': False,
-                'url': url,
-                'error': 'Download cancelled by user'
-            }
-
-        try:
-            ydl_opts = self.get_modern_ydl_opts(audio_only)
-            ydl_opts['outtmpl'] = self.file_manager.get_playlist_output_template(audio_only)
-
-            logger.info(f"Downloading playlist: {url}")
-
-            # Check for shutdown before starting
-            if self._stop_event.is_set():
-                return {
-                    'success': False,
-                    'url': url,
-                    'error': 'Download cancelled by user'
-                }
-
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-
-                # Check if shutdown was requested during download
-                if self._stop_event.is_set():
-                    return {
-                        'success': False,
-                        'url': url,
-                        'error': 'Download interrupted by user'
-                    }
-
-                return {
-                    'success': True,
-                    'url': url,
-                    'type': 'playlist',
-                    'title': info.get('title', 'Unknown Playlist'),
-                    'entry_count': len(info.get('entries', [])),
-                    'downloaded_entries': sum(1 for e in info.get('entries', []) if e.get('requested_downloads'))
-                }
-
-        except Exception as e:
-            logger.error(f"Playlist download failed for {url}: {str(e)}")
-            return {
-                'success': False,
-                'url': url,
-                'error': str(e)
-            }
-
+    # ─────────────────────────────────────────────────────────────────────────
+    # Batch download  (API compatibility)
+    # ─────────────────────────────────────────────────────────────────────────
     def download_multiple_urls(self, urls: List[str], audio_only: Optional[bool] = None) -> List[Dict]:
-        """Download multiple URLs with parallel processing"""
         if audio_only is None:
             audio_only = self.config.get('audio_only', False)
 
-        max_workers = min(self.config.get('max_workers', 3), len(urls))
         results = []
+        max_workers = min(self.config.get('max_workers', 3), len(urls))
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {
-                executor.submit(self.download_single_item, url, audio_only): url
-                for url in urls
-            }
-
-            for future in as_completed(future_to_url):
-                # Check if shutdown was requested
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(self.download_single_item, u, audio_only): u for u in urls}
+            for fut in as_completed(futures):
                 if self._stop_event.is_set():
-                    logger.info("Shutdown requested, cancelling remaining downloads")
-                    # Cancel remaining futures
-                    for f in future_to_url:
-                        if not f.done():
-                            f.cancel()
+                    for f in futures:
+                        f.cancel()
                     break
-
-                url = future_to_url[future]
+                url = futures[fut]
                 try:
-                    result = future.result()
-                    results.append(result)
+                    results.append(fut.result())
                 except Exception as e:
-                    logger.error(f"Thread execution failed for {url}: {str(e)}")
-                    results.append({
-                        'success': False,
-                        'url': url,
-                        'error': str(e)
-                    })
+                    results.append({'success': False, 'url': url, 'error': str(e)})
 
         return results
 
-    def download_single_item(self, url: str, audio_only: bool) -> Dict:
-        """Download a single item (video, playlist, or live stream)"""
-        content_type = get_content_type(url)
 
-        if content_type == 'playlist':
-            return self.download_playlist(url, audio_only)
-        else:
-            return self.download_single_video(url, audio_only)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Error classification
+    # ─────────────────────────────────────────────────────────────────────────
+    def _is_cookie_error(self, error_msg: str) -> bool:
+        """
+        Errors that mean the browser cookie DB could not be read.
+        These are NOT retryable with cookies — we must switch to cookieless mode.
+        """
+        cookie_patterns = [
+            'failed to load cookies',
+            'could not copy',
+            'could not read',
+            'unable to load cookies',
+            'cannot load cookies',
+            'cookiesfrombrowser',
+            'keyring',
+            'dpapi',
+            'sqlite',                   # DB locked by running browser
+            'database is locked',
+            'no such table',
+            'unable to open database',
+        ]
+        low = error_msg.lower()
+        return any(p in low for p in cookie_patterns)
 
     def _is_retryable_error(self, error_msg: str, is_live: bool) -> bool:
-        """Determine if an error is retryable"""
-        retryable_patterns = [
+        """Transient network / server errors worth retrying."""
+        patterns = [
             'HTTP Error 403',
-            'HTTP Error 429',  # Too Many Requests
-            'HTTP Error 502',  # Bad Gateway
-            'HTTP Error 503',  # Service Unavailable
-            'HTTP Error 504',  # Gateway Timeout
+            'HTTP Error 429',
+            'HTTP Error 500',
+            'HTTP Error 502',
+            'HTTP Error 503',
+            'HTTP Error 504',
             'Connection reset',
             'Connection timed out',
             'Network is unreachable',
             'Temporary failure',
             'unable to download video data',
             'Fragment download failed',
+            'Sign in to confirm',       # may succeed with different player client
         ]
-
-        # For live streams, be more aggressive with retries
         if is_live:
-            retryable_patterns.extend([
-                'Live stream',
-                'Stream ended',
-                'Fragment unavailable',
-            ])
+            patterns += ['Live stream', 'Stream ended', 'Fragment unavailable']
 
-        error_lower = error_msg.lower()
-        return any(pattern.lower() in error_lower for pattern in retryable_patterns)
+        low = error_msg.lower()
+        return any(p.lower() in low for p in patterns)
 
-    def _calculate_retry_delay(self, retry_count: int, is_live: bool) -> float:
-        """Calculate retry delay with exponential backoff"""
-        base_delay = 5 if is_live else 2
-        max_delay = 300  # 5 minutes max
+    def _retry_delay(self, attempt: int, is_live: bool) -> float:
+        base  = 5.0 if is_live else 2.0
+        delay = min(base * (2 ** attempt), 300.0)
+        return delay * random.uniform(0.8, 1.2)
 
-        # Exponential backoff: base_delay * (2 ^ retry_count)
-        delay = base_delay * (2 ** retry_count)
-
-        # Add jitter to avoid thundering herd
-        jitter = random.uniform(0.5, 1.5)
-        delay *= jitter
-
-        # Cap at maximum delay
-        delay = min(delay, max_delay)
-
-        return delay
-
+    # ─────────────────────────────────────────────────────────────────────────
+    # Shutdown
+    # ─────────────────────────────────────────────────────────────────────────
     def stop_all_downloads(self):
-        """Stop all ongoing downloads"""
         self._stop_event.set()

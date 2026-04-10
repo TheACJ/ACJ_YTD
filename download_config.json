@@ -36,7 +36,7 @@
   "geo_bypass": true,
   "age_limit": null,
   "archive_file": ".youtube_archive.txt",
-  "use_archive": true,
+  "use_archive": false,
   "prefer_free_formats": false,
   "extract_flat": false,
   "ignore_errors": true,
